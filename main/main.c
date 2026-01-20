@@ -1,4 +1,4 @@
-// station/main.c - 带时间窗口的动态发现+ARP锁定
+// station/main.c - 修复设备发现
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -17,8 +17,8 @@
 #define WIFI_SSID        "RobotNet"
 #define WIFI_PASS        "12345678"
 #define DISCOVERY_PORT   8888
-#define DEVICE_ID        "Robot-2"  // 每个设备烧录不同的ID
-#define DISCOVERY_PERIOD_MS 30000   // 发现阶段持续时间：30秒
+#define DEVICE_ID        "Robot-2"  // Robot-1 或 Robot-2
+#define DISCOVERY_PERIOD_MS 30000
 
 static const char *TAG = "STATION";
 static esp_netif_t *sta_netif = NULL;
@@ -26,9 +26,9 @@ static EventGroupHandle_t s_wifi_event_group;
 const int WIFI_CONNECTED_BIT = BIT0;
 
 // 全局状态
-static bool discovery_phase = true;     // 是否在发现阶段
-static bool arp_locked = false;         // ARP表是否已锁定
-static uint32_t system_start_time = 0;  // 系统启动时间
+static bool discovery_phase = true;
+static bool arp_locked = false;
+static uint32_t system_start_time = 0;
 
 static ip4_addr_t s_local_ip;
 static uint8_t s_local_mac[6];
@@ -47,47 +47,38 @@ static peer_device_t peer_table[MAX_PEERS];
 static int peer_count = 0;
 static SemaphoreHandle_t peer_table_mutex;
 
-// ================== 时间管理 ==================
-void check_system_phase(void)
-{
-    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    uint32_t elapsed = now - system_start_time;
-    
-    if (discovery_phase && elapsed >= DISCOVERY_PERIOD_MS) {
-        // 进入锁定阶段
-        discovery_phase = false;
-        arp_locked = true;
-        ESP_LOGI(TAG, "🚀 发现阶段结束，进入ARP锁定阶段");
-        ESP_LOGI(TAG, "🔒 ARP表已锁定，共发现 %d 个设备", peer_count);
-        
-        // 打印所有已知设备
-        xSemaphoreTake(peer_table_mutex, portMAX_DELAY);
-        for (int i = 0; i < peer_count; i++) {
-            ESP_LOGI(TAG, "  设备 %d: %s (" IPSTR ")", 
-                    i+1, peer_table[i].device_id, IP2STR(&peer_table[i].ip));
-        }
-        xSemaphoreGive(peer_table_mutex);
-    }
-}
-
-// ================== UDP 广播发送 ==================
+// ================== 修复的广播发送函数 ==================
 void broadcast_discovery(void)
 {
     if (!discovery_phase) {
-        return;  // 发现阶段结束，不再发送广播
+        return;
     }
     
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) return;
+    if (sock < 0) {
+        ESP_LOGE(TAG, "创建广播socket失败");
+        return;
+    }
     
-    int broadcast = 1;
-    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+    // 允许广播
+    int broadcast_enable = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable)) < 0) {
+        ESP_LOGE(TAG, "设置广播选项失败");
+        close(sock);
+        return;
+    }
     
+    // 使用定向广播地址（192.168.4.255）而不是全局广播
     struct sockaddr_in broadcast_addr = {
         .sin_family = AF_INET,
         .sin_port = htons(DISCOVERY_PORT),
-        .sin_addr.s_addr = htonl(INADDR_BROADCAST)
+        .sin_addr.s_addr = inet_addr("192.168.4.255")  // 定向广播
     };
+    
+    // 如果inet_addr失败，使用另一种方式设置广播地址
+    if (broadcast_addr.sin_addr.s_addr == INADDR_NONE) {
+        broadcast_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    }
     
     char msg[256];
     snprintf(msg, sizeof(msg),
@@ -97,21 +88,35 @@ void broadcast_discovery(void)
              s_local_mac[0], s_local_mac[1], s_local_mac[2],
              s_local_mac[3], s_local_mac[4], s_local_mac[5]);
     
-    sendto(sock, msg, strlen(msg), 0, 
-           (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
+    ESP_LOGD(TAG, "发送广播: %s", msg);
+    
+    int sent = sendto(sock, msg, strlen(msg), 0, 
+                     (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
+    
+    if (sent < 0) {
+        ESP_LOGE(TAG, "广播发送失败 (errno=%d)", errno);
+    } else {
+        ESP_LOGD(TAG, "广播发送成功，%d字节", sent);
+    }
     
     close(sock);
 }
 
-// ================== UDP 广播接收 ==================
+// ================== 修复的广播接收任务 ==================
 void discovery_receiver_task(void *pvParameters)
 {
+    ESP_LOGI(TAG, "广播接收任务启动");
+    
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
-        ESP_LOGE(TAG, "Discovery receiver socket failed");
+        ESP_LOGE(TAG, "创建接收socket失败");
         vTaskDelete(NULL);
         return;
     }
+    
+    // 允许地址重用
+    int reuse = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     
     struct sockaddr_in local_addr = {
         .sin_family = AF_INET,
@@ -119,7 +124,14 @@ void discovery_receiver_task(void *pvParameters)
         .sin_addr.s_addr = INADDR_ANY
     };
     
-    bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr));
+    if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+        ESP_LOGE(TAG, "绑定端口失败 (errno=%d)", errno);
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    ESP_LOGI(TAG, "已绑定到端口 %d", DISCOVERY_PORT);
     
     char buffer[256];
     
@@ -132,43 +144,61 @@ void discovery_receiver_task(void *pvParameters)
         
         if (len > 0) {
             buffer[len] = '\0';
+            ESP_LOGD(TAG, "收到广播: %s (来自 %s:%d)", 
+                    buffer, inet_ntoa(src_addr.sin_addr), ntohs(src_addr.sin_port));
             
             // 如果在锁定阶段，忽略发现消息
             if (arp_locked) {
                 continue;
             }
             
+            // 解析发现消息
             if (strncmp(buffer, "DISCOVERY:ID=", 13) == 0) {
                 char device_id[32];
                 char ip_str[16];
                 uint8_t mac[6];
                 
+                // 解析格式: DISCOVERY:ID=xxx:IP=xxx.xxx.xxx.xxx:MAC=xx:xx:xx:xx:xx:xx
                 if (sscanf(buffer, "DISCOVERY:ID=%31[^:]:IP=%15[^:]:MAC=%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
                           device_id, ip_str,
                           &mac[0], &mac[1], &mac[2],
                           &mac[3], &mac[4], &mac[5]) == 8) {
                     
+                    ESP_LOGD(TAG, "解析成功: ID=%s, IP=%s", device_id, ip_str);
+                    
+                    // 跳过自己的广播
                     if (strcmp(device_id, DEVICE_ID) == 0) {
+                        ESP_LOGD(TAG, "忽略自己的广播");
                         continue;
                     }
                     
                     ip4_addr_t peer_ip;
-                    ip4addr_aton(ip_str, &peer_ip);
+                    if (ip4addr_aton(ip_str, &peer_ip) == 0) {
+                        ESP_LOGE(TAG, "IP地址解析失败: %s", ip_str);
+                        continue;
+                    }
                     
                     xSemaphoreTake(peer_table_mutex, portMAX_DELAY);
                     
                     bool found = false;
                     for (int i = 0; i < peer_count; i++) {
-                        if (peer_table[i].ip.addr == peer_ip.addr) {
+                        if (peer_table[i].ip.addr == peer_ip.addr || 
+                            strcmp(peer_table[i].device_id, device_id) == 0) {
+                            // 更新现有设备
                             memcpy(peer_table[i].mac, mac, 6);
                             strcpy(peer_table[i].device_id, device_id);
                             peer_table[i].last_seen = xTaskGetTickCount();
+                            peer_table[i].ip = peer_ip;
                             found = true;
+                            
+                            ESP_LOGI(TAG, "更新设备: %s (" IPSTR ")", 
+                                    device_id, IP2STR(&peer_ip));
                             break;
                         }
                     }
                     
                     if (!found && peer_count < MAX_PEERS) {
+                        // 添加新设备
                         peer_table[peer_count].ip = peer_ip;
                         memcpy(peer_table[peer_count].mac, mac, 6);
                         strcpy(peer_table[peer_count].device_id, device_id);
@@ -176,42 +206,57 @@ void discovery_receiver_task(void *pvParameters)
                         peer_table[peer_count].arp_injected = false;
                         peer_count++;
                         
-                        ESP_LOGI(TAG, "📱 发现新设备: %s (IP:" IPSTR ")", 
-                                device_id, IP2STR(&peer_ip));
+                        ESP_LOGI(TAG, "📱 发现新设备: %s (IP:" IPSTR " MAC:%02x:%02x:%02x:%02x:%02x:%02x)", 
+                                device_id, IP2STR(&peer_ip),
+                                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
                     }
                     
                     xSemaphoreGive(peer_table_mutex);
+                } else {
+                    ESP_LOGW(TAG, "广播消息格式错误: %s", buffer);
                 }
+            } else {
+                ESP_LOGD(TAG, "非发现消息: %s", buffer);
             }
+        } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            ESP_LOGE(TAG, "接收错误 (errno=%d)", errno);
         }
     }
 }
 
-// ================== ARP 管理 ==================
+// ================== 增强的ARP管理 ==================
 void manage_arp_entries(void)
 {
     xSemaphoreTake(peer_table_mutex, portMAX_DELAY);
     
-    // 如果ARP已锁定，只维护现有条目，不添加新条目
     for (int i = 0; i < peer_count; i++) {
         if (!peer_table[i].arp_injected) {
-            // 如果是锁定阶段，直接标记为已注入（不再实际注入）
             if (arp_locked) {
+                // 锁定阶段发现新设备，警告但不注入
                 peer_table[i].arp_injected = true;
-                ESP_LOGW(TAG, "⚠️  锁定阶段发现新设备 %s，但不会注入ARP", 
+                ESP_LOGW(TAG, "⚠️ 锁定阶段发现新设备 %s，跳过ARP注入", 
                         peer_table[i].device_id);
                 continue;
             }
             
-            // 发现阶段：正常注入ARP
+            // 发现阶段：注入ARP
             struct eth_addr peer_mac;
             memcpy(peer_mac.addr, peer_table[i].mac, 6);
             
+            // 先移除可能存在的旧条目
+            etharp_remove_static_entry(&peer_table[i].ip);
+            
+            // 添加静态ARP条目
             err_t err = etharp_add_static_entry(&peer_table[i].ip, &peer_mac);
             if (err == ERR_OK) {
                 peer_table[i].arp_injected = true;
-                ESP_LOGI(TAG, "✅ ARP注入: %s (" IPSTR ")", 
-                        peer_table[i].device_id, IP2STR(&peer_table[i].ip));
+                ESP_LOGI(TAG, "✅ ARP注入: %s (" IPSTR ") → %02x:%02x:%02x:%02x:%02x:%02x", 
+                        peer_table[i].device_id, IP2STR(&peer_table[i].ip),
+                        peer_table[i].mac[0], peer_table[i].mac[1], peer_table[i].mac[2],
+                        peer_table[i].mac[3], peer_table[i].mac[4], peer_table[i].mac[5]);
+            } else {
+                ESP_LOGE(TAG, "❌ ARP注入失败: %s (err=%d)", 
+                        peer_table[i].device_id, err);
             }
         }
     }
@@ -219,40 +264,110 @@ void manage_arp_entries(void)
     xSemaphoreGive(peer_table_mutex);
 }
 
-// ================== 发送数据（在锁定阶段使用静态ARP）==================
+// ================== 修复的发送数据函数 ==================
 void send_to_all_peers(void)
 {
+    if (peer_count == 0) {
+        ESP_LOGW(TAG, "没有发现任何设备，无法发送数据");
+        return;
+    }
+    
     xSemaphoreTake(peer_table_mutex, portMAX_DELAY);
     
     for (int i = 0; i < peer_count; i++) {
-        // 检查设备是否支持通信
         if (!peer_table[i].arp_injected) {
+            ESP_LOGW(TAG, "跳过设备 %s (ARP未注入)", peer_table[i].device_id);
             continue;
         }
         
         int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (sock < 0) continue;
+        if (sock < 0) {
+            ESP_LOGE(TAG, "创建socket失败 (errno=%d)", errno);
+            continue;
+        }
         
-        struct sockaddr_in dest_addr = {0};
-        dest_addr.sin_family = AF_INET;
-        dest_addr.sin_port = htons(12345);
-        dest_addr.sin_addr.s_addr = peer_table[i].ip.addr;
+        // 设置发送超时
+        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        
+        struct sockaddr_in dest_addr = {
+            .sin_family = AF_INET,
+            .sin_port = htons(12345),
+            .sin_addr.s_addr = peer_table[i].ip.addr
+        };
         
         char msg[128];
         if (arp_locked) {
-            snprintf(msg, sizeof(msg), "LOCKED: %s → %s (无ARP)", 
-                    DEVICE_ID, peer_table[i].device_id);
+            snprintf(msg, sizeof(msg), "🔒 锁定阶段: %s → %s (时间: %lu)", 
+                    DEVICE_ID, peer_table[i].device_id, 
+                    xTaskGetTickCount() * portTICK_PERIOD_MS / 1000);
         } else {
-            snprintf(msg, sizeof(msg), "DISCOVERY: %s → %s", 
+            snprintf(msg, sizeof(msg), "🔍 发现阶段: %s → %s", 
                     DEVICE_ID, peer_table[i].device_id);
         }
         
-        sendto(sock, msg, strlen(msg), 0, 
-               (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        int sent = sendto(sock, msg, strlen(msg), 0, 
+                         (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        
+        if (sent < 0) {
+            if (errno == EHOSTUNREACH) {
+                ESP_LOGE(TAG, "发送失败: 主机不可达 (目标: %s " IPSTR ")", 
+                        peer_table[i].device_id, IP2STR(&peer_table[i].ip));
+            } else {
+                ESP_LOGE(TAG, "发送失败 (errno=%d)", errno);
+            }
+        } else {
+            ESP_LOGI(TAG, "✅ 发送成功: %s → %s (%d字节)", 
+                    DEVICE_ID, peer_table[i].device_id, sent);
+        }
         
         close(sock);
     }
     
+    xSemaphoreGive(peer_table_mutex);
+}
+
+// ================== 时间管理 ==================
+void check_system_phase(void)
+{
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t elapsed = now - system_start_time;
+    
+    if (discovery_phase && elapsed >= DISCOVERY_PERIOD_MS) {
+        discovery_phase = false;
+        arp_locked = true;
+        
+        ESP_LOGI(TAG, "🚀 发现阶段结束，进入ARP锁定阶段");
+        ESP_LOGI(TAG, "🔒 ARP表已锁定，共发现 %d 个设备", peer_count);
+        
+        xSemaphoreTake(peer_table_mutex, portMAX_DELAY);
+        for (int i = 0; i < peer_count; i++) {
+            ESP_LOGI(TAG, "  设备 %d: %s (" IPSTR ")", 
+                    i+1, peer_table[i].device_id, IP2STR(&peer_table[i].ip));
+        }
+        xSemaphoreGive(peer_table_mutex);
+    }
+}
+
+// ================== 防止ARP请求 ==================
+void suppress_arp_requests(void)
+{
+    // 禁用ARP请求发送
+    struct netif *netif = netif_default;
+    if (netif) {
+        netif->flags &= ~NETIF_FLAG_ETHARP;
+        ESP_LOGI(TAG, "🛑 已禁用ARP请求发送");
+    }
+    
+    // 确保所有已知设备都有ARP条目
+    xSemaphoreTake(peer_table_mutex, portMAX_DELAY);
+    for (int i = 0; i < peer_count; i++) {
+        if (peer_table[i].arp_injected) {
+            struct eth_addr peer_mac;
+            memcpy(peer_mac.addr, peer_table[i].mac, 6);
+            etharp_add_static_entry(&peer_table[i].ip, &peer_mac);
+        }
+    }
     xSemaphoreGive(peer_table_mutex);
 }
 
@@ -324,33 +439,12 @@ void station_init(void)
     xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 }
 
-// ================== 防止ARP请求的终极方案 ==================
-void suppress_arp_requests(void)
-{
-    // 修改lwIP配置，禁用ARP请求
-    extern struct netif *netif_default;
-    
-    if (netif_default) {
-        // 设置接口不发送ARP请求
-        netif_default->flags &= ~NETIF_FLAG_ETHARP;
-        ESP_LOGI(TAG, "🛑 已禁用ARP请求发送");
-    }
-    
-    // 确保所有已知设备都有ARP条目
-    xSemaphoreTake(peer_table_mutex, portMAX_DELAY);
-    for (int i = 0; i < peer_count; i++) {
-        if (peer_table[i].arp_injected) {
-            struct eth_addr peer_mac;
-            memcpy(peer_mac.addr, peer_table[i].mac, 6);
-            etharp_add_static_entry(&peer_table[i].ip, &peer_mac);
-        }
-    }
-    xSemaphoreGive(peer_table_mutex);
-}
-
-// ================== 主函数 ==================
+// ================== 主函数 - 增强调试 ==================
 void app_main(void)
 {
+    ESP_LOGI(TAG, "========== 设备 %s 启动 ==========", DEVICE_ID);
+    
+    // 初始化NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NEW_VERSION_FOUND || ret == ESP_ERR_NVS_NO_FREE_PAGES) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -358,22 +452,26 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
     
+    // 网络初始化
     esp_netif_init();
     esp_event_loop_create_default();
     
-    // 记录系统启动时间
+    // 记录启动时间
     system_start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
     
     // 初始化设备表
     peer_table_mutex = xSemaphoreCreateMutex();
     
+    // 连接WiFi
     station_init();
     ESP_LOGI(TAG, "设备 %s 启动，发现阶段30秒", DEVICE_ID);
     
-    // 创建发现接收任务
+    // 启动广播接收任务
+    ESP_LOGI(TAG, "启动广播接收任务...");
     xTaskCreate(discovery_receiver_task, "discovery_rcv", 4096, NULL, 5, NULL);
     
     // 等待网络稳定
+    ESP_LOGI(TAG, "等待网络稳定 (3秒)...");
     vTaskDelay(pdMS_TO_TICKS(3000));
     
     // 主循环
@@ -381,32 +479,34 @@ void app_main(void)
     int arp_manage_counter = 0;
     bool arp_suppressed = false;
     
+    ESP_LOGI(TAG, "开始主循环...");
+    
     while (1) {
         // 检查系统阶段
         check_system_phase();
         
-        // 发现阶段：每3秒发送一次广播
-        if (discovery_phase && broadcast_counter++ >= 3) {
+        // 发现阶段：每秒发送一次广播（增加频率）
+        if (discovery_phase && broadcast_counter++ >= 1) {
             broadcast_discovery();
             broadcast_counter = 0;
         }
         
-        // 管理ARP条目（发现阶段每2秒一次，锁定阶段每10秒一次）
+        // 管理ARP条目
         if (arp_manage_counter++ >= (arp_locked ? 10 : 2)) {
             manage_arp_entries();
             arp_manage_counter = 0;
         }
         
-        // 进入锁定阶段后，执行一次ARP抑制
+        // 进入锁定阶段后，执行ARP抑制
         if (arp_locked && !arp_suppressed) {
             suppress_arp_requests();
             arp_suppressed = true;
             ESP_LOGI(TAG, "🔐 系统已锁定，开始正常通信（无ARP）");
         }
         
-        // 发送数据（发现阶段每5秒，锁定阶段每3秒）
+        // 发送数据
         static int data_counter = 0;
-        int send_interval = arp_locked ? 3 : 5;
+        int send_interval = arp_locked ? 2 : 3;  // 锁定阶段更频繁发送
         if (data_counter++ >= send_interval) {
             send_to_all_peers();
             data_counter = 0;
@@ -416,7 +516,7 @@ void app_main(void)
         
         // 显示状态信息
         static int status_counter = 0;
-        if (status_counter++ >= 10) {
+        if (status_counter++ >= 5) {  // 每5秒显示一次
             ESP_LOGI(TAG, "状态: %s阶段 | 发现设备数: %d | ARP锁定: %s",
                     discovery_phase ? "发现" : "锁定",
                     peer_count,
